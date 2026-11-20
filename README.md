@@ -75,5 +75,19 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 异常分区修复清单
+
+支付事件按业务日期落入湖表日分区。缺少业务日期时**不再用当天日期兜底**，而是登记到
+异常分区修复清单（`backend/app/services/partition_repair.py`），清单保留原始时间与目标分区。
+
+- 归属口径：`按接入时间归属`（落到接入时间所在分区）或 `按空值隔离`（落到隔离分区），
+  在湖上分区页调整，只有分区的归属团队可以改，其他团队只能查看受控结果。
+- 状态单向：`待修复 → 已归属`。已归属的记录不允许回退或改写，同一支付事件只会有一个
+  可查询分区；再次检查只会命中已有归属。
+- 断点恢复：`POST /api/partition_repair/recover` 只补登记尚未进入清单的事件，已在清单里的行
+  原样保留，避免反复改写让同一事件在多个分区残留。
+- Iceberg 同步：Iceberg 管理页通过 `GET /api/iceberg_table/partitions/payments` 读取支付表
+  分区归属，归属时携带湖上分区的来源版本（`LAKE-0003@v1`）写入 `iceberg_partition_metadata`。
+
 领域：数据工程
 子方向：数仓与数据湖

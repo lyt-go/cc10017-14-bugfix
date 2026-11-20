@@ -76,6 +76,76 @@
       <span>共 {{ total }} 条湖上分区记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section class="repair-panel" data-testid="repair-panel">
+      <header class="panel-head">
+        <div>
+          <h3>异常分区修复清单</h3>
+          <p class="page-desc">
+            支付事件缺少业务日期时不再用当天日期兜底；清单保留原始时间与目标分区，归属后同步 Iceberg 元数据。
+          </p>
+        </div>
+        <div class="page-actions">
+          <select v-model="operatorTeam" data-testid="operator-team" aria-label="操作团队">
+            <option v-for="team in teams" :key="team" :value="team">{{ team }}</option>
+          </select>
+          <button class="btn" data-testid="recover" type="button" @click="recover">断点恢复</button>
+        </div>
+      </header>
+
+      <div class="routing-bar">
+        <label class="filter-item">
+          <span>缺失业务日期归属口径</span>
+          <select v-model="routingRule" data-testid="routing-rule" @change="saveRouting">
+            <option v-for="rule in routingRules" :key="rule" :value="rule">{{ rule }}</option>
+          </select>
+        </label>
+        <span class="panel-hint" data-testid="routing-version">来源版本 {{ routingVersion || '—' }}</span>
+        <form class="event-form" @submit.prevent="submitEvent">
+          <input v-model="eventValues['支付事件编号']" data-testid="event-code" placeholder="支付事件编号" required />
+          <input v-model="eventValues['业务日期']" data-testid="event-business-date" placeholder="业务日期 YYYY-MM-DD（可空）" />
+          <input v-model="eventValues['接入时间']" data-testid="event-ingested-at" placeholder="接入时间 ISO（可空）" />
+          <button class="btn primary" data-testid="submit-event" type="submit">登记支付事件</button>
+        </form>
+      </div>
+
+      <table class="data-table repair-table">
+        <thead>
+          <tr>
+            <th v-for="column in repairColumns" :key="column">{{ column }}</th>
+            <th>可执行动作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="row in repairs"
+            :key="String(row.id)"
+            :data-testid="`repair-row-${row.id}`"
+            :data-status="String(row.状态)"
+            :data-event="String(row.支付事件编号)"
+          >
+            <td v-for="column in repairColumns" :key="column">{{ row[column] ?? '—' }}</td>
+            <td class="row-actions">
+              <button
+                v-if="row.状态 === '待修复'"
+                class="link"
+                type="button"
+                :data-testid="`assign-${row.id}`"
+                :title="canEdit(row) ? '归属分区并同步 Iceberg 元数据' : '其他团队只能查看受控结果'"
+                @click="assignRepair(row)"
+              >
+                归属分区
+              </button>
+              <span v-else class="panel-hint" :data-testid="`assigned-${row.id}`">已归属，不可重复改写</span>
+            </td>
+          </tr>
+          <tr v-if="!repairs.length">
+            <td :colspan="repairColumns.length + 1" class="empty-state">暂无异常分区，支付事件均已按业务日期归属</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="repairMessage" class="panel-hint" data-testid="repair-message">{{ repairMessage }}</p>
+    </section>
   </section>
 </template>
 
@@ -184,5 +254,117 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+// ── 异常分区修复清单 ──
+const REPAIR_ENDPOINT = '/api/partition_repair'
+const teams = ['数据平台组', '订单数据组', '用户增长组']
+const routingRules = ['按接入时间归属', '按空值隔离']
+const repairColumns = ['清单编号', '支付事件编号', '原始时间', '目标分区', '归属口径', '来源版本', '状态']
+const repairs = ref<Row[]>([])
+const repairMessage = ref('')
+const operatorTeam = ref(teams[0])
+const routingRule = ref(routingRules[0])
+const routingVersion = ref('')
+const eventValues = ref<Record<string, string>>({
+  支付事件编号: '', 业务日期: '', 接入时间: '', 目标表名: 'payments',
+})
+
+function canEdit(row: Row) {
+  const owner = row.归属团队
+  return !owner || owner === operatorTeam.value
+}
+
+async function loadRouting() {
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/routing`)
+    if (!response.ok) return
+    const payload = await response.json()
+    routingRule.value = payload.routing_rule ?? routingRules[0]
+    routingVersion.value = payload.source_version ?? ''
+  } catch {
+    routingVersion.value = ''
+  }
+}
+
+async function saveRouting() {
+  repairMessage.value = ''
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/routing`, {
+      method: 'POST',
+      body: JSON.stringify({ 归属口径: routingRule.value, 操作团队: operatorTeam.value }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) {
+      repairMessage.value = payload.message || '归属口径调整失败'
+      await loadRouting()
+      return
+    }
+    routingVersion.value = payload.entry?.来源版本 ?? routingVersion.value
+    repairMessage.value = payload.message
+    await reloadRepairs()
+  } catch (error) {
+    repairMessage.value = error instanceof Error ? error.message : '归属口径调整失败'
+  }
+}
+
+async function reloadRepairs() {
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/repairs?table_name=payments&size=200`)
+    if (!response.ok) throw new Error('异常分区修复清单读取失败')
+    const payload = await response.json()
+    repairs.value = payload.items ?? []
+  } catch (error) {
+    repairMessage.value = error instanceof Error ? error.message : '异常分区修复清单读取失败'
+  }
+}
+
+async function submitEvent() {
+  repairMessage.value = ''
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/events`, {
+      method: 'POST', body: JSON.stringify(eventValues.value),
+    })
+    const payload = await response.json()
+    repairMessage.value = payload.message || ''
+    if (!response.ok || !payload.ok) return
+    eventValues.value = { ...eventValues.value, 支付事件编号: '', 业务日期: '', 接入时间: '' }
+    await reloadRepairs()
+  } catch (error) {
+    repairMessage.value = error instanceof Error ? error.message : '支付事件登记失败'
+  }
+}
+
+async function assignRepair(row: Row) {
+  repairMessage.value = ''
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/repairs/${row.id}/assign`, {
+      method: 'POST',
+      body: JSON.stringify({ 操作团队: operatorTeam.value }),
+    })
+    const payload = await response.json()
+    repairMessage.value = payload.message || ''
+    await reloadRepairs()
+  } catch (error) {
+    repairMessage.value = error instanceof Error ? error.message : '归属分区失败'
+  }
+}
+
+async function recover() {
+  repairMessage.value = ''
+  try {
+    const response = await request(`${REPAIR_ENDPOINT}/recover`, {
+      method: 'POST', body: JSON.stringify({ 目标表名: 'payments' }),
+    })
+    const payload = await response.json()
+    repairMessage.value = payload.message || ''
+    await reloadRepairs()
+  } catch (error) {
+    repairMessage.value = error instanceof Error ? error.message : '断点恢复失败'
+  }
+}
+
+onMounted(() => {
+  void reload()
+  void loadRouting()
+  void reloadRepairs()
+})
 </script>

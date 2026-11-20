@@ -83,6 +83,21 @@ def create_entry(payload: dict[str, object]) -> ActionResult:
     return ActionResult(ok=True, message="表元数据已登记", entry=entry)
 
 
+@router.get("/partitions/{table_name}", response_model=dict)
+def get_payment_partitions(table_name: str = "payments") -> dict:
+    """查看支付表分区归属：数据来自湖上分区生成的异常分区修复清单，按事件去重。"""
+    return service.payment_partitions(table_name)
+
+
+@router.post("/partitions/{table_name}/apply", response_model=ActionResult)
+def apply_repair_list(table_name: str = "payments") -> ActionResult:
+    """接收异常分区修复清单并更新支付表分区元数据，保留湖上分区的来源版本。"""
+    entry, message = service.apply_repair_list(table_name)
+    if entry is None:
+        return ActionResult(ok=False, message=message)
+    return ActionResult(ok=True, message=message, entry=entry)
+
+
 @router.post("/{entry_id}/actions", response_model=ActionResult)
 def run_action(entry_id: int, payload: ActionPayload) -> ActionResult:
     """对单条表元数据执行提交校验、确认就绪、标记下线；不允许的动作会被拦下并说明原因。"""

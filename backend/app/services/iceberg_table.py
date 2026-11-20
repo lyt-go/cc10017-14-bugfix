@@ -1,8 +1,13 @@
-"""Iceberg管理业务规则：状态流转、字段校验与筛选口径都收在这里。"""
+"""Iceberg管理业务规则：状态流转、字段校验与筛选口径都收在这里。
+
+增强：Iceberg 管理跨模块接收湖上分区生成的异常分区修复清单，把支付事件归属结果
+写进分区元数据，并保留湖上分区的来源版本。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.services.partition_repair import PAY_TABLE, repair_service
 from app.store import store
 
 MODULE = "iceberg_table"
@@ -63,3 +68,33 @@ class IcebergTableService:
         entry["pending"] = target != STATUS_ORDER[-1]
         entry["abnormal"] = action in NEGATIVE_ACTIONS
         return entry, f"表元数据已{action}"
+
+    def payment_partitions(self, table_name: str = PAY_TABLE) -> dict[str, Any]:
+        """查看支付表分区归属：读取湖上分区生成的异常分区修复清单，按事件去重。"""
+        return repair_service.list_iceberg_partitions(table_name=table_name)
+
+    def apply_repair_list(self, table_name: str = PAY_TABLE) -> tuple[dict[str, Any] | None, str]:
+        """接收异常分区修复清单并更新支付表分区元数据。
+
+        已归属的记录按清单口径重放同步，待修复的记录不落元数据，保证元数据里
+        同一支付事件只有一个可查询分区。
+        """
+        iceberg = next(
+            (row for row in store.rows(MODULE) if row.get("表名称") == table_name), None)
+        if iceberg is None:
+            return None, f"表元数据 {table_name} 未登记"
+        repairs, _total = repair_service.list_repairs(table_name=table_name, size=100000)
+        applied = 0
+        for repair in repairs:
+            if repair.get("状态") != "已归属":
+                continue
+            repair_service.sync_iceberg_metadata(repair)
+            applied += 1
+        detail = repair_service.list_iceberg_partitions(table_name=table_name)
+        return {
+            "table_name": table_name,
+            "applied_count": applied,
+            "pending_repairs": len(repairs) - applied,
+            "partition_source_version": detail.get("partition_source_version"),
+            "partitions": detail.get("partitions"),
+        }, f"异常分区修复清单已同步，支付表 {table_name} 分区元数据更新 {applied} 条"

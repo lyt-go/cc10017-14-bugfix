@@ -76,6 +76,55 @@
       <span>共 {{ total }} 条Iceberg管理记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <section class="repair-panel" data-testid="iceberg-partition-panel">
+      <header class="panel-head">
+        <div>
+          <h3>支付表分区归属</h3>
+          <p class="page-desc">
+            读取湖上分区生成的异常分区修复清单，按事件展示唯一归属分区，并保留湖上分区的来源版本。
+          </p>
+        </div>
+        <button class="btn" data-testid="refresh-partitions" type="button" @click="reloadPartitions">刷新分区</button>
+      </header>
+      <div class="routing-bar">
+        <span class="panel-hint" data-testid="partition-meta-version">元数据版本 {{ partitionDetail.metadata_version ?? '—' }}</span>
+        <span class="panel-hint" data-testid="partition-source-version">分区来源版本 {{ partitionDetail.partition_source_version ?? '—' }}</span>
+        <span class="panel-hint" data-testid="partition-count">已归属分区 {{ partitionDetail.partition_count ?? 0 }}</span>
+        <span class="panel-hint" data-testid="pending-repair-count">待修复 {{ partitionDetail.pending_repair_count ?? 0 }}</span>
+      </div>
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>支付事件编号</th>
+            <th>清单编号</th>
+            <th>目标分区</th>
+            <th>原始时间</th>
+            <th>来源版本</th>
+            <th>归属状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="row in partitionDetail.partitions ?? []"
+            :key="String(row.event_code)"
+            :data-testid="`partition-${row.event_code}`"
+            :data-partition="String(row.partition)"
+          >
+            <td>{{ row.event_code }}</td>
+            <td>{{ row.repair_code ?? '—' }}</td>
+            <td>{{ row.partition ?? '—' }}</td>
+            <td>{{ row.original_time ?? '—' }}</td>
+            <td>{{ row.source_version ?? '—' }}</td>
+            <td>{{ row.status ?? '—' }}</td>
+          </tr>
+          <tr v-if="!(partitionDetail.partitions ?? []).length">
+            <td colspan="6" class="empty-state">暂无已归属的支付事件分区，可先在湖上分区页生成修复清单</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-if="partitionMessage" class="panel-hint" data-testid="partition-message">{{ partitionMessage }}</p>
+    </section>
   </section>
 </template>
 
@@ -185,4 +234,35 @@ async function reload() {
 }
 
 onMounted(reload)
+
+// ── 支付表分区归属（数据来源：湖上分区页生成的异常分区修复清单）──
+type PartitionDetail = {
+  metadata_version: string | null
+  partition_source_version: string | null
+  partition_count: number | null
+  pending_repair_count: number | null
+  partitions: Record<string, string | number | null>[] | null
+}
+
+const partitionDetail = ref<PartitionDetail>({
+  metadata_version: null,
+  partition_source_version: null,
+  partition_count: 0,
+  pending_repair_count: 0,
+  partitions: [],
+})
+const partitionMessage = ref('')
+
+async function reloadPartitions() {
+  partitionMessage.value = ''
+  try {
+    const response = await request(`${ENDPOINT}/partitions/payments`)
+    if (!response.ok) throw new Error('支付表分区元数据读取失败')
+    partitionDetail.value = await response.json()
+  } catch (error) {
+    partitionMessage.value = error instanceof Error ? error.message : '支付表分区元数据读取失败'
+  }
+}
+
+onMounted(reloadPartitions)
 </script>
